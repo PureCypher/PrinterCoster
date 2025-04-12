@@ -10,7 +10,7 @@ class PrintCostCalculator:
     def __init__(self, root):
         self.root = root
         self.root.title("3D Print Cost Calculator")
-        self.root.geometry("800x600")
+        self.root.geometry("650x800")
         
         # G-code parsing results
         self.gcode_time_seconds = None
@@ -194,27 +194,39 @@ class PrintCostCalculator:
         
         if None in (power_cost, power_usage, print_time, num_items):
             return
-            
+
         # Calculate power cost
         power_cost_value = (power_usage / 1000) * print_time * power_cost
         
-        # Calculate total filament cost
+        # Calculate total filament cost and update weights
         total_filament_cost = 0
         filament_details = []
+        weight_updates = []
         
         for spool in self.spool_frames:
             spool_data = spool['data']
             name = spool_data['name'].get()
             cost = self.validate_float(spool_data['cost'].get(), f"Spool Cost ({name})")
-            weight = self.validate_float(spool_data['weight'].get(), f"Spool Weight ({name})")
+            weight = self.validate_float(spool_data['weight'].get(), f"Total Weight ({name})")
             used = self.validate_float(spool_data['used'].get(), f"Used Weight ({name})")
             
             if None in (cost, weight, used):
                 return
-                
-            spool_cost = (used / weight) * cost
+            
+            # Safety check for used weight greater than remaining weight
+            if used > weight:
+                messagebox.showerror("Error", f"Used weight ({used}g) cannot be greater than remaining weight ({weight}g) for {name}")
+                return
+            
+            # Calculate cost based on simple cost per gram
+            cost_per_gram = cost / 1000.0  # Cost per gram based on standard 1kg spool
+            spool_cost = used * cost_per_gram  # Cost for grams used
             total_filament_cost += spool_cost
             filament_details.append(f"{name}: ${spool_cost:.2f}")
+            
+            # Update remaining weight
+            remaining_weight = max(weight - used, 0.0)
+            weight_updates.append((spool_data['weight'], remaining_weight))
         
         # Calculate total and per-item costs
         total_cost = power_cost_value + total_filament_cost
@@ -225,6 +237,13 @@ class PrintCostCalculator:
         self.filament_cost_result.set(f"${total_filament_cost:.2f}\n" + "\n".join(filament_details))
         self.total_cost_result.set(f"${total_cost:.2f}")
         self.cost_per_item_result.set(f"${cost_per_item:.2f}")
+        
+        # Update spool weights after successful calculation
+        for weight_var, new_weight in weight_updates:
+            weight_var.set(f"{new_weight:.2f}")
+        
+        # Show confirmation message
+        messagebox.showinfo("Weight Updated", "Used filament deducted from spools. Remember to save settings to preserve changes.")
         
     def validate_int(self, value, field_name):
         try:
