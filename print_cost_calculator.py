@@ -3,11 +3,18 @@ from ttkbootstrap.constants import *
 from tkinter import messagebox, filedialog
 import json
 from pathlib import Path
+import re
+import zipfile
+
 class PrintCostCalculator:
     def __init__(self, root):
         self.root = root
         self.root.title("3D Print Cost Calculator")
         self.root.geometry("800x600")
+        
+        # G-code parsing results
+        self.gcode_time_seconds = None
+        self.gcode_filament_mm = None
         
         # Configure style for consistent appearance
         self.style = ttk.Style()
@@ -98,7 +105,7 @@ class PrintCostCalculator:
     def create_widgets(self):
         # Title with improved styling
         title_label = ttk.Label(self.main_frame, text="3D Print Cost Calculator",
-                              style="Title.TLabel", bootstyle="primary")
+                               style="Title.TLabel", bootstyle="primary")
         title_label.grid(row=0, column=0, columnspan=2, pady=(0, 15))
         
         # Basic inputs section with improved styling
@@ -121,12 +128,17 @@ class PrintCostCalculator:
         button_frame = ttk.Frame(self.main_frame)
         button_frame.grid(row=3, column=0, columnspan=2, pady=15)
         
+        ttk.Button(button_frame, text="Load G-code",
+                  command=self.load_gcode,
+                  bootstyle="primary").grid(row=0, column=0, padx=5)
+                  
         ttk.Button(button_frame, text="Add Filament Spool",
                   command=self.create_spool_frame,
-                  bootstyle="info").grid(row=0, column=0, padx=5)
+                  bootstyle="info").grid(row=0, column=1, padx=5)
+                  
         ttk.Button(button_frame, text="Reset All",
                   command=self.reset_all,
-                  bootstyle="warning").grid(row=0, column=1, padx=5)
+                  bootstyle="warning").grid(row=0, column=2, padx=5)
         
         # Add initial spool frame
         self.create_spool_frame()
@@ -224,6 +236,7 @@ class PrintCostCalculator:
         except ValueError:
             messagebox.showerror("Invalid Input", f"Please enter a valid whole number for {field_name}", icon="error")
             return None
+
     def reset_all(self):
         # Reset basic inputs
         self.power_cost.set("0.15")
@@ -360,6 +373,144 @@ class PrintCostCalculator:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to export results: {str(e)}")
 
+    def load_gcode(self):
+        """Load and parse a G-code file to extract print time and filament usage."""
+        file_path = filedialog.askopenfilename(
+            filetypes=[("G-code Files", "*.gcode *.gcode.3mf")],
+            title="Load G-code File"
+        )
+        if not file_path:
+            return
+
+        try:
+            # Check if this is a .gcode.3mf file
+            if file_path.endswith('.gcode.3mf') or file_path.endswith('.3mf'):
+                try:
+                    with zipfile.ZipFile(file_path, 'r') as zip_file:
+                        gcode_files = [f for f in zip_file.namelist() if f.endswith('.gcode')]
+                        if not gcode_files:
+                            messagebox.showerror("Error", "No G-code file found in the 3MF container")
+                            return
+                        with zip_file.open(gcode_files[0]) as f:
+                            raw = f.read()
+                except zipfile.BadZipFile:
+                    messagebox.showerror("Error", "Invalid or corrupted 3MF container")
+                    return
+            else:
+                with open(file_path, 'rb') as f:
+                    raw = f.read()
+
+            # Try UTF-8 first, then fall back to Latin-1
+            try:
+                text = raw.decode('utf-8')
+            except UnicodeDecodeError:
+                try:
+                    text = raw.decode('latin-1')
+                except UnicodeDecodeError:
+                    messagebox.showerror("Error", "Could not decode the G-code content.")
+                    return
+
+            # Initialize variables
+            self.gcode_time_seconds = None
+            self.gcode_filament_mm = None
+            absolute_e = True
+            current_e = 0.0
+            total_extrusion = 0.0
+            total_moves = 0
+            total_lines = 0
+            g1_lines = 0
+
+            # Process the decoded content
+            for line in text.splitlines():
+                total_lines += 1
+                try:
+                    line = line.strip()
+                    if not line or line.startswith(';'):
+                        continue
+
+                    if self.gcode_time_seconds is None:
+                        time_patterns = [
+                            (r';TIME:(\d+)', 1),
+                            (r';Print time: (\d+)', 1),
+                            (r';Estimated printing time: .* (\d+)s', 1),
+                            (r'M73 P\d+ R(\d+)', 60),
+                            (r';TIME_ELAPSED:(\d+\.?\d*)', 1),
+                            (r'; estimated printing time = .* = (\d+)s', 1)
+                        ]
+                        for pattern, multiplier in time_patterns:
+                            time_match = re.search(pattern, line, re.IGNORECASE)
+                            if time_match:
+                                value = float(time_match.group(1))
+                                self.gcode_time_seconds = value * multiplier
+                                break
+
+                    fil_match = re.search(r';Filament used:\s*([\d.]+)\s*mm', line, re.IGNORECASE)
+                    if fil_match:
+                        self.gcode_filament_mm = float(fil_match.group(1))
+                        continue
+
+                    if 'M83' in line:
+                        absolute_e = False
+                        continue
+                    elif 'M82' in line:
+                        absolute_e = True
+                        continue
+
+                    if 'G1' in line:
+                        g1_lines += 1
+                        e_match = re.search(r'(?:^|[^0-9.])[Gg]1.*[Ee]([-+]?\d*\.?\d+)', line)
+                        if e_match:
+                            total_moves += 1
+                            new_e = float(e_match.group(1))
+                            extrusion = new_e - current_e if absolute_e else new_e
+                            if extrusion > 0:
+                                total_extrusion += extrusion
+                            current_e = new_e if absolute_e else current_e + new_e
+                            continue
+
+                    if re.search(r'[Gg]92.*[Ee].*0', line):
+                        current_e = 0.0
+
+                except (ValueError, IndexError):
+                    continue
+
+            # Calculate final values
+            if self.gcode_filament_mm is None or self.gcode_filament_mm <= 0:
+                self.gcode_filament_mm = total_extrusion
+
+            # Update UI
+            if self.gcode_filament_mm > 0:
+                filament_grams = self.gcode_filament_mm / 330
+                if not self.spool_frames:
+                    self.create_spool_frame()
+                self.spool_frames[0]['data']['used'].set(f"{filament_grams:.1f}")
+
+            if self.gcode_time_seconds is not None:
+                self.print_time.set(f"{self.gcode_time_seconds/3600:.2f}")
+
+            # Show results
+            if self.gcode_time_seconds is None and self.gcode_filament_mm is None:
+                messagebox.showerror(
+                    "Error",
+                    "Could not find print time or filament usage in the G-code file."
+                )
+            else:
+                results = []
+                if self.gcode_time_seconds is not None:
+                    hours = self.gcode_time_seconds // 3600
+                    minutes = (self.gcode_time_seconds % 3600) // 60
+                    results.append(f"Print Time: {int(hours)}h {int(minutes)}m")
+                if self.gcode_filament_mm is not None:
+                    grams = self.gcode_filament_mm / 330
+                    results.append(f"Filament Usage: {grams:.1f}g ({self.gcode_filament_mm:.1f}mm)")
+                messagebox.showinfo("Success", "\n".join(results))
+
+        except FileNotFoundError:
+            messagebox.showerror("Error", "File not found or could not be opened.")
+        except PermissionError:
+            messagebox.showerror("Error", "Permission denied while trying to read the file.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to parse G-code file: {str(e)}")
 
 def main():
     root = ttk.Window(themename="darkly")
